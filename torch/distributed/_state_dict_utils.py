@@ -5,11 +5,14 @@ import math
 import weakref
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, cast, NamedTuple, Optional, TYPE_CHECKING, Union
+from logging import getLogger
+import logging
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import AsyncCollectiveTensor
+from torch.distributed._pin_memory_utils import pin_shared_mem, unpin_memory
 
 
 if dist.is_available() or TYPE_CHECKING:
@@ -19,6 +22,8 @@ if dist.is_available() or TYPE_CHECKING:
     from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 
+logger = getLogger()
+
 def _identity_func(
     obj: torch.Tensor,
     pg: Optional[dist.ProcessGroup],
@@ -27,6 +32,13 @@ def _identity_func(
 ) -> torch.Tensor:
     return obj
 
+def _pin_shared_mem(t: torch.Tensor) -> None:
+    pin_shared_mem(t.data_ptr(), t.numel() * t.element_size())
+
+    def _unpin_memory(t):
+        unpin_memory(t.data_ptr())
+
+    weakref.finalize(t, _unpin_memory, t)
 
 def _all_gather_sharded_tensor(
     sharded_tensor: "ShardedTensor",
@@ -130,22 +142,27 @@ def _iterate_state_dict(
             )
             raise CompanionMismatch(msg)
 
-        ret = {
-            key: _iterate_state_dict(
-                value,
-                sharded_tensor_func,
-                dtensor_func,
-                tensor_func,
-                pg=pg,
-                device=device,
-                cpu_offload=cpu_offload,
-                companion_obj=companion_obj[key] if companion_obj is not None else None,
-                ranks_only=ranks_only,
-                type_check=type_check,
-                non_blocking=non_blocking,
-            )
-            for key, value in iter_object.items()
-        }
+        ret = {}
+        for key, value in iter_object.items():
+            try:
+                obj = _iterate_state_dict(
+                    value,
+                    sharded_tensor_func,
+                    dtensor_func,
+                    tensor_func,
+                    pg=pg,
+                    device=device,
+                    cpu_offload=cpu_offload,
+                    companion_obj=(
+                        companion_obj[key] if companion_obj is not None else None
+                    ),
+                    ranks_only=ranks_only,
+                    type_check=type_check,
+                    non_blocking=non_blocking,
+                )
+                ret[key] = obj
+            except Exception as e:
+                raise RuntimeError(f"Failed to iterate {key}") from e
     elif isinstance(iter_object, (list, tuple)):
         if companion_obj is not None and (
             not isinstance(companion_obj, (list, tuple))
@@ -153,8 +170,9 @@ def _iterate_state_dict(
         ):
             raise CompanionMismatch
 
-        ret = [
-            _iterate_state_dict(
+        ret = []
+        for idx, v in enumerate(iter_object):
+            obj = _iterate_state_dict(
                 v,
                 sharded_tensor_func,
                 dtensor_func,
@@ -167,8 +185,7 @@ def _iterate_state_dict(
                 type_check=type_check,
                 non_blocking=non_blocking,
             )
-            for idx, v in enumerate(iter_object)
-        ]
+            ret.append(obj)
         if isinstance(iter_object, tuple):
             ret = tuple(ret)
     elif not type_check:
@@ -402,28 +419,20 @@ def _create_cpu_state_dict(
         if len(obj.size()) == 0:
             return torch.tensor(0, dtype=obj.dtype)
 
+        # sometimes, a tensor might have non-zero size and 0 numel. In this case, pinning memory will fail
+        # so we take a best guess at how to replicate the tensor below to maintain symetry in the outputted
+        # state dict
+        if obj.numel() == 0 or obj.data_ptr() == 0:
+            t = torch.zeros_like(obj, device="cpu")
+            if share_memory:
+                t = t.share_memory_()
+            return t
+
         if share_memory:
             t = torch.empty(*tuple(obj.size()), dtype=obj.dtype)
             t = t.share_memory_()
             if pin_memory:
-
-                def unpin_memory(t):
-                    succ = int(torch.cuda.cudart().cudaHostUnregister(t.data_ptr()))
-                    assert succ == 0, (
-                        f"Unpinning shared memory failed with error-code: {succ}"
-                    )
-
-                weakref.finalize(t, unpin_memory, t)
-                succ = int(
-                    torch.cuda.cudart().cudaHostRegister(
-                        t.data_ptr(),
-                        t.numel() * t.element_size(),
-                        1,  # lines up with 'cudaHostRegisterPortable'
-                    )
-                )
-                assert succ == 0, (
-                    f"Pinning shared memory failed with error-code: {succ}"
-                )
+                _pin_shared_mem(t)
             return t
         elif pin_memory:
             return torch.empty(*tuple(obj.size()), dtype=obj.dtype).pin_memory()
@@ -457,9 +466,9 @@ def _create_cpu_state_dict(
         ranks_only=(),
         type_check=False,
     )
+
     return ret
-
-
+    
 def _check_state_dict_similarity(
     state_dict: dict[str, Any],
     compared_state_dict: dict[str, Any],
