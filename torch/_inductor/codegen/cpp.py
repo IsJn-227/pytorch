@@ -216,13 +216,17 @@ def reduction_combine(
     reduction_type,
     var,
     next_value,
+    helper_val=None,
     index: Optional[sympy.Symbol] = None,
     src_dtype=None,
 ):
     is_bool = src_dtype == torch.bool
     if reduction_type == "sum":
-        conjunction = "|" if is_bool else "+"
-        return f"{var} {conjunction} {next_value}"
+        if helper_val and not is_bool:
+            return f"cascade_sum_combine({next_value}, &{helper_val})"
+        else:
+            conjunction = "|" if is_bool else "+"
+            return f"{var} {conjunction} {next_value}"
     if reduction_type == "prod":
         return f"{var} * {next_value}"
     if reduction_type == "xor_sum":
@@ -2129,6 +2133,49 @@ class CppKernel(Kernel):
         for gen_fn in self.reduction_prefix_generators:
             self.reduction_prefix.splice(gen_fn(size))
 
+    def _improve_precision_helper_init(
+        self, reduction_type, helper_val, helper_range, dtype, num_threads=None
+    ):
+        num_range_thread = (
+            CeilDiv(helper_range, num_threads) if num_threads else helper_range
+        )
+        num_range_thread_expr = cexpr_index(num_range_thread)
+        assert reduction_type == "sum" and dtype != torch.bool
+        chunk_size = 2**16
+        num_chunks = CeilDiv(num_range_thread, chunk_size)
+        helper_type = "CascadeSumHelper"
+        helper_init_line = (
+            f"{helper_type}<{DTYPE_TO_CPP[dtype]}, {chunk_size}> {helper_val}"
+            f"("
+            f"{num_range_thread_expr}"
+            f");"
+        )
+        return helper_init_line
+
+    def _use_improve_precision_helper(
+        self, reduction_type, acc, helper_val, helper_range, dtype
+    ):
+        num_threads = (
+            "max_threads" if config.cpp.dynamic_threads else parallel_num_threads()
+        )
+        self.non_parallel_reduction_prefix.writeline(
+            self._improve_precision_helper_init(
+                reduction_type, helper_val, helper_range, dtype
+            )
+        )
+        self.local_reduction_init.writeline(
+            self._improve_precision_helper_init(
+                reduction_type, helper_val, helper_range, dtype, num_threads
+            )
+        )
+
+        self.non_parallel_reduction_suffix.writeline(
+            f"{acc} = cascade_sum_final(&{helper_val});"
+        )
+        self.local_reduction_stores.writeline(
+            f"{acc}_local = cascade_sum_final(&{helper_val});"
+        )
+
     def reduction(self, dtype, src_dtype, reduction_type, value):
         argmax_or_argmin = reduction_type in ("argmax", "argmin")
         reduction_key = src_dtype, reduction_type, value
@@ -2147,14 +2194,29 @@ class CppKernel(Kernel):
                 acc, acc_type, reduction_type, init_dtype, reduction_init
             )
         )
-        # TODO add cascade sum suport for scalar reduction
-        assert self.reduction_depth is not None
-        index = self.itervars[self.reduction_depth]
-        for i in range(self.reduction_depth + 1, len(self.itervars)):
-            index = index * self.ranges[i] + self.itervars[i]
-        self.stores.writeline(
-            f"{acc} = {reduction_combine(reduction_type, acc, value, index)};"
-        )
+
+        if reduction_type == "sum" and src_dtype != torch.bool:
+            # use cascade_helper for vec kernel
+            reduction_size = functools.reduce(
+                operator.mul, self.ranges[self.reduction_depth :]
+            )
+            helper_val = self.cascade_helper_cse.generate(
+                self.compute, f"reduction {reduction_key}", write=False
+            )
+            self._use_improve_precision_helper(
+                reduction_type, acc, helper_val, reduction_size, dtype
+            )
+            self.stores.writeline(
+                f"{reduction_combine(reduction_type, acc, value, helper_val)};"
+            )
+        else:
+            assert self.reduction_depth is not None
+            index = self.itervars[self.reduction_depth]
+            for i in range(self.reduction_depth + 1, len(self.itervars)):
+                index = index * self.ranges[i] + self.itervars[i]
+            self.stores.writeline(
+                f"{acc} = {reduction_combine(reduction_type, acc, value, index=index)};"
+            )
 
         self._gen_parallel_reduction_buffers(acc, acc_type, reduction_type, init_dtype)
         result = reduction_project(reduction_type, acc)
@@ -2864,7 +2926,7 @@ class CppVecKernel(CppKernel):
                 )
             )
 
-            # use welford_helper for vec kernel
+            # use welford_helper/cascade_helper for vec kernel
             assert self.reduction_depth is not None
             reduction_size = functools.reduce(
                 operator.mul, self.ranges[self.reduction_depth :]
