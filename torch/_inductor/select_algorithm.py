@@ -1081,27 +1081,32 @@ class TritonTemplateKernel(TritonKernel):
     def codegen_range_tree(self):
         pass  # ignore default codegen
 
-    def call_kernel(self, name: str, node: Optional[ir.IRNode] = None):
-        wrapper = V.graph.wrapper_code
-        _, call_args, _, arg_types = self.args.python_argdefs()
-
-        grid_args = ()
+    def additional_call_args_and_types(self):
         if isinstance(self.grid_fn, SymbolicGridFn):
             grid_args = self.grid_fn.sympy_call(*self.call_sizes, self.meta)
+            assert len(grid_args) in (0, 3), "grid_fn should return 3 values"
+            return (grid_args, map(type, grid_args))
         elif all(isinstance(x, (int, sympy.Integer)) for x in self.call_sizes):
             grid_args = self.grid_fn(*map(int, self.call_sizes), self.meta)
+            assert len(grid_args) in (0, 3), "grid_fn should return 3 values"
+            return (grid_args, map(type, grid_args))
         else:
             assert not V.graph.cpp_wrapper, "cpp_wrapper requires SymbolicGridFn"
             wrapper.add_import_once(f"import {self.grid_fn.__module__}")
             meta = wrapper.add_meta_once(self.meta)
             fn_name = f"{self.grid_fn.__module__}.{self.grid_fn.__name__}"
-            call_args.append(
-                f"*{fn_name}({', '.join(map(pexpr, self.call_sizes))}, {meta})"
+            return(
+                f"*{fn_name}({', '.join(map(pexpr, self.call_sizes))}, {meta})",
+                None
             )
-            arg_types.append(None)
-        assert len(grid_args) in (0, 3), "grid_fn should return 3 values"
-        call_args.extend(grid_args)
-        arg_types.extend(map(type, grid_args))
+
+    def call_kernel(self, name: str, node: Optional[ir.IRNode] = None):
+        wrapper = V.graph.wrapper_code
+        _, call_args, _, arg_types = self.args.python_argdefs()
+
+        additional_call_args, additional_arg_types = self.additional_call_args()
+        call_args.extend(additional_call_args)
+        arg_types.extend(additional_arg_types)
 
         if self.workspace_arg is not None:
             wrapper.generate_workspace_allocation(self.workspace_arg)
@@ -2207,12 +2212,12 @@ class AlgorithmSelectorCache(PersistentCache):
                 return choices[0].output_node()
 
         @functools.cache
-        def make_benchmark_fn():
-            return self.make_benchmark_fn(choices, input_nodes, layout, input_gen_fns)
+        def make_benchmark_fn(hint_override: Optional[int] = None):
+            return self.make_benchmark_fn(choices, input_nodes, layout, input_gen_fns, hint_override=hint_override)
 
         inputs_key = create_inputs_key(input_nodes)
 
-        def autotune(choices):
+        def autotune(choices, hint_override: Optional[int] = None):
             log.debug("Starting autotuning")
 
             with dynamo_timed(
@@ -2234,13 +2239,13 @@ class AlgorithmSelectorCache(PersistentCache):
                     ),
                 },
             ):
-                return make_benchmark_fn()(choices)
+                return make_benchmark_fn(hint_override=hint_override)(choices)
 
         if config.autotune_in_subproc:
             # Initialize the suprocess pool so it will warmup early.
             torch._inductor.autotune_process.get_tuning_process_pool()
 
-        def do_autotuning(choices, precompile_fn):
+        def do_autotuning(choices, precompile_fn, hint_override: Optional[int] = None):
             precompile_start_ts = time.time()
             with dynamo_timed(
                 f"{name}_template_precompiling",
@@ -2262,6 +2267,7 @@ class AlgorithmSelectorCache(PersistentCache):
                     name,
                     inputs_key,
                     autotune,
+                    hint_override=hint_override
                 )
                 choices = self.prune_choices_postscreen(
                     choices, timings, name, inputs_key, self.prescreening_cache
@@ -2275,6 +2281,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 name,
                 inputs_key,
                 autotune,
+                hint_override=hint_override
             )
 
             autotune_elapse = time.time() - autotune_start_ts
@@ -2336,8 +2343,8 @@ class AlgorithmSelectorCache(PersistentCache):
 
         if return_multi_template and (config.max_autotune or config.max_autotune_gemm):
 
-            def get_timings():
-                timings = do_autotuning(choices, precompile_fn)
+            def get_timings(hint_override: Optional[int] = None):
+                timings = do_autotuning(choices, precompile_fn, hint_override=hint_override)
                 min_extern_choice = float("inf")
                 for choice, timing in timings.items():
                     if isinstance(choice, ExternKernelCaller):
@@ -2576,6 +2583,7 @@ class AlgorithmSelectorCache(PersistentCache):
         input_nodes: list[ir.IRNode],
         layout: ir.Layout,
         input_gen_fns: Optional[dict[int, Callable[[ir.Buffer], torch.Tensor]]],
+        hint_override: Optional[int] = None,
     ) -> AutotuneArgs:
         """
         Factory method to create AutotuneArgs from a list of ChoiceCallers.
@@ -2598,14 +2606,17 @@ class AlgorithmSelectorCache(PersistentCache):
                     V.graph.sizevars.size_hints(
                         input_node.get_size(),
                         fallback=config.unbacked_symint_fallback,
+                        hint_override=hint_override,
                     ),
                     V.graph.sizevars.size_hints(
                         input_node.get_stride(),
                         fallback=config.unbacked_symint_fallback,
+                        hint_override=hint_override,
                     ),
                     V.graph.sizevars.size_hint(
                         input_node.get_layout().offset,
                         fallback=config.unbacked_symint_fallback,
+                        hint_override=hint_override,
                     ),
                 )
             )
@@ -2720,8 +2731,11 @@ class AlgorithmSelectorCache(PersistentCache):
         input_nodes: list[ir.IRNode],
         layout: ir.Layout,
         input_gen_fns: Optional[dict[int, Callable[[ir.Buffer], torch.Tensor]]],
+        hint_override: Optional[int] = None,
     ) -> dict[ChoiceCaller, float]:
-        inputs = cls.get_inputs(choices, input_nodes, layout, input_gen_fns)
+        inputs = cls.get_inputs(
+            choices, input_nodes, layout, input_gen_fns, hint_override=hint_override
+        )
         return cls.benchmark_choices(choices, inputs)
 
     @classmethod
@@ -2731,6 +2745,7 @@ class AlgorithmSelectorCache(PersistentCache):
         input_nodes: list[ir.IRNode],
         layout: ir.Layout,
         input_gen_fns: Optional[dict[int, Callable[[ir.Buffer], torch.Tensor]]],
+        hint_override: Optional[int] = None,
     ):
         from . import autotune_process
 
@@ -2740,7 +2755,7 @@ class AlgorithmSelectorCache(PersistentCache):
         triton = [c for c in choices if not isinstance(c, ExternKernelCaller)]
 
         timings = cls.benchmark_in_current_process(
-            extern, input_nodes, layout, input_gen_fns
+            extern, input_nodes, layout, input_gen_fns, hint_override=hint_override
         )
         timings.update(autotune_process.benchmark_in_sub_process(triton))  # type: ignore[arg-type]
         return timings
@@ -2752,6 +2767,7 @@ class AlgorithmSelectorCache(PersistentCache):
         input_nodes: list[ir.IRNode],
         layout: ir.Layout,
         input_gen_fns: Optional[dict[int, Callable[[ir.Buffer], torch.Tensor]]],
+        hint_override: Optional[int] = None,
     ):
         if DEBUG:
             print(f"{len(choices)} tuning requests:")
@@ -2762,6 +2778,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 input_nodes=input_nodes,
                 layout=layout,
                 input_gen_fns=input_gen_fns,
+                hint_override=hint_override,
             )
         else:
             return functools.partial(
@@ -2769,6 +2786,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 input_nodes=input_nodes,
                 layout=layout,
                 input_gen_fns=input_gen_fns,
+                hint_override=hint_override,
             )
 
     @staticmethod
