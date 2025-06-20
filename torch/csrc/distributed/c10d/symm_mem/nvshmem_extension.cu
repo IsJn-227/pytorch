@@ -3,7 +3,6 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.cuh>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.h>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 #include <cuda_awbarrier_primitives.h>
 // Use torch's cub wrapper instead of CUDA's <cub/cub.cuh>, see #55292
@@ -122,6 +121,15 @@ at::Tensor nvshmem_broadcast(at::Tensor& input, const std::string& group_name) {
   auto stream = at::cuda::getCurrentCUDAStream();
   nvshmemx_broadcastmem_on_stream(team, buffer_ptr, buffer_ptr, input_hdl->get_buffer_size(), 0, stream);
   return input;
+}
+
+void nvshmem_put(at::Tensor& inp, c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> dest, const int64_t peer) {
+  void* buffer_ptr = dest->get_buffer_ptrs()[peer];
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // TODO: If the size of the tensor is one of 8, 16, 32, 64, 128
+  // use nvshmemx_putSIZE_on_stream
+  nvshmemx_getmem_on_stream(buffer_ptr, inp.data_ptr(), inp.numel(), 0, stream);
 }
 
 at::Tensor nvshmem_all_to_all(
@@ -606,6 +614,7 @@ at::Tensor nvshmem_all_to_all_vdev_2d(
 
 TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
   m.impl("nvshmem_broadcast", c10d::nvshmem_extension::nvshmem_broadcast);
+  m.impl("nvshmem_put", c10d::nvshmem_extension::nvshmem_put);
   m.impl("nvshmem_all_to_all", c10d::nvshmem_extension::nvshmem_all_to_all);
   m.impl("nvshmem_all_to_all_vdev", c10d::nvshmem_extension::nvshmem_all_to_all_vdev);
   m.impl("nvshmem_all_to_all_vdev_2d", c10d::nvshmem_extension::nvshmem_all_to_all_vdev_2d);
